@@ -5,6 +5,7 @@ import base64
 import math
 import cv2
 import qrcode
+import numpy as np
 
 # Configuration Constants
 CHUNK_SIZE = 300  # Number of raw bytes per QR code (keep small for low-density QR codes)
@@ -39,8 +40,9 @@ def sender(file_path):
     qr = qrcode.QRCode(box_size=10, border=2)
     qr.add_data(metadata)
     qr.make(fit=True)
-    frames.append(cv2.cvtColor(str(qr.make_image().convert('RGB')), cv2.COLOR_RGB2BGR))
-    
+    img = qr.make_image().convert('RGB')
+    frames.append(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR))
+
     # Data frames (seq numbers 1 to total_chunks)
     for i in range(total_chunks):
         start = i * CHUNK_SIZE
@@ -57,7 +59,6 @@ def sender(file_path):
         qr.add_data(payload)
         qr.make(fit=True)
         img = qr.make_image().convert('RGB')
-        import numpy as np
         opencv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
         frames.append(opencv_img)
 
