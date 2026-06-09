@@ -1,6 +1,5 @@
 import sys
 import os
-import time
 import base64
 import math
 import cv2
@@ -8,9 +7,16 @@ import qrcode
 import numpy as np
 
 # Configuration Constants
-CHUNK_SIZE = 300  # Number of raw bytes per QR code (keep small for low-density QR codes)
-DELAY = 0.2       # Delay in seconds between frames on the sender side
+CHUNK_SIZE = 300  
 HEADER_DELIMITER = "|"
+
+def create_qr_image(data):
+    """Helper function to generate an OpenCV-compatible image from a string."""
+    qr = qrcode.QRCode(box_size=10, border=2)
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image().convert('RGB')
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 def sender(file_path):
     if not os.path.exists(file_path):
@@ -21,152 +27,160 @@ def sender(file_path):
     with open(file_path, "rb") as f:
         file_bytes = f.read()
 
-    # Calculate chunks
     total_chunks = math.ceil(len(file_bytes) / CHUNK_SIZE)
     print(f"[+] File size: {len(file_bytes)} bytes")
-    print(f"[+] Total QR codes to transmit: {total_chunks}")
-    print("[+] Initializing transmission. Press 'q' in the window to abort.")
+    print(f"[+] Total chunks to transmit: {total_chunks}")
+    print("[+] Initializing Two-Way Transmission. Press 'q' to abort.")
 
-    cv2.namedWindow("Sender - Scan with Receiver", cv2.WINDOW_NORMAL)
-
-    # First, send a metadata chunk (seq = 0) containing filename and total chunks
-    # Structure: 0|total_chunks|filename
-    metadata = f"0{HEADER_DELIMITER}{total_chunks}{HEADER_DELIMITER}{file_name}"
-    
-    # Generate all QR frames beforehand for smooth playback
+    # Pre-generate all Data frames to save CPU during transmission
+    # Protocol Format -> D|seq_num|total_chunks|payload
     frames = []
     
-    # Metadata frame
-    qr = qrcode.QRCode(box_size=10, border=2)
-    qr.add_data(metadata)
-    qr.make(fit=True)
-    img = qr.make_image().convert('RGB')
-    frames.append(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR))
-
-    # Data frames (seq numbers 1 to total_chunks)
+    # Seq 0: Metadata
+    metadata = f"D{HEADER_DELIMITER}0{HEADER_DELIMITER}{total_chunks}{HEADER_DELIMITER}{file_name}"
+    frames.append(create_qr_image(metadata))
+    
+    # Seq 1..N: Data Chunks
     for i in range(total_chunks):
         start = i * CHUNK_SIZE
         end = min(start + CHUNK_SIZE, len(file_bytes))
-        chunk_data = file_bytes[start:end]
+        b64_data = base64.b64encode(file_bytes[start:end]).decode('utf-8')
         
-        # Base64 encode the binary data to make it safe for string transport
-        b64_data = base64.b64encode(chunk_data).decode('utf-8')
-        
-        # Structure: seq_num|total_chunks|payload
-        payload = f"{i+1}{HEADER_DELIMITER}{total_chunks}{HEADER_DELIMITER}{b64_data}"
-        
-        qr = qrcode.QRCode(box_size=10, border=2)
-        qr.add_data(payload)
-        qr.make(fit=True)
-        img = qr.make_image().convert('RGB')
-        opencv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        frames.append(opencv_img)
+        payload = f"D{HEADER_DELIMITER}{i+1}{HEADER_DELIMITER}{total_chunks}{HEADER_DELIMITER}{b64_data}"
+        frames.append(create_qr_image(payload))
 
-    # Loop and display the frames sequentially
-    idx = 0
-    while True:
-        cv2.imshow("Sender - Scan with Receiver", frames[idx])
-        
-        # Calculate visual pacing
-        if idx == 0:
-            # Give the receiver longer to lock onto the metadata frame initially
-            key = cv2.waitKey(1500) & 0xFF
-        else:
-            key = cv2.waitKey(int(DELAY * 1000)) & 0xFF
+    # Initialize Webcam & Detector
+    cap = cv2.VideoCapture(0)
+    detector = cv2.QRCodeDetector()
+    current_seq = 0
 
-        if key == ord('q'):
+    cv2.namedWindow("Sender - SHOW THIS TO RECEIVER", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("Sender Camera", cv2.WINDOW_NORMAL)
+
+    while current_seq <= total_chunks:
+        # 1. Display the current chunk we are trying to send
+        cv2.imshow("Sender - SHOW THIS TO RECEIVER", frames[current_seq])
+
+        # 2. Check webcam for an ACK from the receiver
+        ret, frame = cap.read()
+        if not ret:
+            print("[-] Webcam failed.")
             break
-            
-        idx = (idx + 1) % len(frames)
 
+        cv2.imshow("Sender Camera", frame)
+
+        data, _, _ = detector.detectAndDecode(frame)
+        
+        # Protocol Format -> A|seq_num
+        if data and data.startswith("A" + HEADER_DELIMITER):
+            try:
+                ack_seq = int(data.split(HEADER_DELIMITER)[1])
+                if ack_seq == current_seq:
+                    print(f"[+] Received ACK for chunk {current_seq}. Moving to next.")
+                    current_seq += 1
+            except Exception:
+                pass # Ignore malformed QR reads
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("[-] Aborted by user.")
+            break
+
+    if current_seq > total_chunks:
+        print("[+] All chunks successfully acknowledged! Transmission complete.")
+
+    cap.release()
     cv2.destroyAllWindows()
-    print("[+] Transmission stopped.")
+
 
 def receiver():
-    # Initialize the OpenCV QR code detector
+    cap = cv2.VideoCapture(0)
     detector = cv2.QRCodeDetector()
     
-    # Initialize webcam (0 is typically the default built-in camera)
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[-] Error: Could not open webcam.")
-        return
-
-    print("[+] Webcam initialized. Point it at the Sender screen.")
-    
-    metadata_received = False
-    file_name = "received_file"
+    expected_seq = 0
     total_chunks = 0
+    file_name = "received_file"
     chunks_dict = {}
     
-    cv2.namedWindow("Receiver View", cv2.WINDOW_NORMAL)
+    ack_img = None # Will hold the QR image for the ACK we need to display
+    
+    print("[+] Waiting for sender... Press 'q' to abort.")
+    
+    cv2.namedWindow("Receiver Camera", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("Receiver - SHOW THIS TO SENDER", cv2.WINDOW_NORMAL)
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("[-] Failed to grab frame.")
             break
 
-        # Detect and decode QR code
-        data, points, _ = detector.detectAndDecode(frame)
+        # 1. Scan for incoming Data chunks
+        data, _, _ = detector.detectAndDecode(frame)
         
-        if data:
+        if data and data.startswith("D" + HEADER_DELIMITER):
             try:
-                parts = data.split(HEADER_DELIMITER, 2)
-                if len(parts) == 3:
-                    seq_num = int(parts[0])
-                    t_chunks = int(parts[1])
-                    payload = parts[2]
-                    
-                    if seq_num == 0 and not metadata_received:
-                        total_chunks = t_chunks
+                parts = data.split(HEADER_DELIMITER, 3)
+                seq_num = int(parts[1])
+                t_chunks = int(parts[2])
+                payload = parts[3]
+                
+                if seq_num == expected_seq:
+                    if seq_num == 0:
                         file_name = payload
-                        metadata_received = True
-                        print(f"[+] Metadata Detected! File: {file_name} | Total Chunks: {total_chunks}")
-                    
-                    elif seq_num > 0 and seq_num not in chunks_dict:
+                        total_chunks = t_chunks
+                        print(f"[+] Metadata received. File: {file_name}")
+                    else:
                         chunks_dict[seq_num] = payload
-                        print(f"[+] Received Chunk {seq_num}/{total_chunks} "
-                              f"({len(chunks_dict)}/{total_chunks} unique chunks collected)")
-            except Exception as e:
-                pass  # Ignore bad reads or temporary parsing issues due to camera blur
+                        print(f"[+] Received Chunk {seq_num}/{total_chunks}")
+                    
+                    # Generate the ACK for the chunk we just got
+                    ack_img = create_qr_image(f"A{HEADER_DELIMITER}{seq_num}")
+                    expected_seq += 1
 
-        # Overlay progress on camera frame
-        status_text = f"Chunks: {len(chunks_dict)}/{total_chunks if total_chunks else '?'}"
-        cv2.putText(frame, status_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                elif seq_num < expected_seq:
+                    # The sender missed our ACK and is re-broadcasting an old chunk.
+                    # Re-generate the ACK for that specific old chunk to help them move forward.
+                    ack_img = create_qr_image(f"A{HEADER_DELIMITER}{seq_num}")
+
+            except Exception:
+                pass
+
+        # 2. Show the camera view (for alignment)
+        cv2.imshow("Receiver Camera", frame)
         
-        cv2.imshow("Receiver View", frame)
-        
-        # Check if all chunks are assembled
-        if total_chunks > 0 and len(chunks_dict) == total_chunks:
-            print("[+] All chunks successfully received! Reassembling file...")
+        # 3. Display the ACK QR code for the sender to scan
+        if ack_img is not None:
+            cv2.imshow("Receiver - SHOW THIS TO SENDER", ack_img)
+
+        # Check for completion
+        if total_chunks > 0 and expected_seq > total_chunks:
+            print("[+] All data received! Sending final ACK buffer...")
+            # Leave the final ACK on screen for a second so the sender can catch it
+            cv2.waitKey(2000) 
             break
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("[-] Capture aborted by user.")
-            cap.release()
-            cv2.destroyAllWindows()
-            return
+            break
 
-    # Clean up tracking windows
     cap.release()
     cv2.destroyAllWindows()
 
-    # Reassemble and write file
-    try:
-        file_bytes = bytearray()
-        for i in range(1, total_chunks + 1):
-            b64_payload = chunks_dict[i]
-            file_bytes.extend(base64.b64decode(b64_payload))
-        
-        # Save to a distinct filename to prevent over-writing if in same directory
-        output_name = "transferred_" + file_name
-        with open(output_name, "wb") as f:
-            f.write(file_bytes)
-        print(f"[+] Success! File saved to disk as: {output_name}")
-        
-    except Exception as e:
-        print(f"[-] Error reassembling file data: {e}")
+    # Reassemble file
+    if total_chunks > 0 and len(chunks_dict) == total_chunks:
+        try:
+            file_bytes = bytearray()
+            for i in range(1, total_chunks + 1):
+                b64_payload = chunks_dict[i]
+                file_bytes.extend(base64.b64decode(b64_payload))
+            
+            output_name = "transferred_" + file_name
+            with open(output_name, "wb") as f:
+                f.write(file_bytes)
+            print(f"[+] Success! File saved to disk as: {output_name}")
+            
+        except Exception as e:
+            print(f"[-] Error reassembling file data: {e}")
+    else:
+        print("[-] Transfer incomplete. No file saved.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
