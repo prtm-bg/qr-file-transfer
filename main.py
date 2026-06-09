@@ -6,7 +6,6 @@ import cv2
 import qrcode
 import numpy as np
 
-# Configuration Constants
 CHUNK_SIZE = 300  
 HEADER_DELIMITER = "|"
 
@@ -28,11 +27,10 @@ def sender(file_path):
         file_bytes = f.read()
 
     total_chunks = math.ceil(len(file_bytes) / CHUNK_SIZE)
-    print(f"[+] File size: {len(file_bytes)} bytes")
-    print(f"[+] Total chunks to transmit: {total_chunks}")
-    print("[+] Initializing Two-Way Transmission. Press 'q' to abort.")
+    print(f"File size: {len(file_bytes)} bytes")
+    print(f"Total chunks to transmit: {total_chunks}")
+    print("Initializing Two-Way Transmission. Press 'q' to abort.")
 
-    # Pre-generate all Data frames to save CPU during transmission
     # Protocol Format -> D|seq_num|total_chunks|payload
     frames = []
     
@@ -49,7 +47,6 @@ def sender(file_path):
         payload = f"D{HEADER_DELIMITER}{i+1}{HEADER_DELIMITER}{total_chunks}{HEADER_DELIMITER}{b64_data}"
         frames.append(create_qr_image(payload))
 
-    # Initialize Webcam & Detector
     cap = cv2.VideoCapture(0)
     detector = cv2.QRCodeDetector()
     current_seq = 0
@@ -58,13 +55,11 @@ def sender(file_path):
     cv2.namedWindow("Sender Camera", cv2.WINDOW_NORMAL)
 
     while current_seq <= total_chunks:
-        # 1. Display the current chunk we are trying to send
         cv2.imshow("Sender - SHOW THIS TO RECEIVER", frames[current_seq])
 
-        # 2. Check webcam for an ACK from the receiver
         ret, frame = cap.read()
         if not ret:
-            print("[-] Webcam failed.")
+            print("Webcam failed.")
             break
 
         cv2.imshow("Sender Camera", frame)
@@ -76,17 +71,17 @@ def sender(file_path):
             try:
                 ack_seq = int(data.split(HEADER_DELIMITER)[1])
                 if ack_seq == current_seq:
-                    print(f"[+] Received ACK for chunk {current_seq}. Moving to next.")
+                    print(f"Received ACK for chunk {current_seq}. Moving to next.")
                     current_seq += 1
             except Exception:
                 pass # Ignore malformed QR reads
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("[-] Aborted by user.")
+            print("Aborted by user.")
             break
 
     if current_seq > total_chunks:
-        print("[+] All chunks successfully acknowledged! Transmission complete.")
+        print("All chunks successfully acknowledged! Transmission complete.")
 
     cap.release()
     cv2.destroyAllWindows()
@@ -103,7 +98,7 @@ def receiver():
     
     ack_img = None # Will hold the QR image for the ACK we need to display
     
-    print("[+] Waiting for sender... Press 'q' to abort.")
+    print("Waiting for sender... Press 'q' to abort.")
     
     cv2.namedWindow("Receiver Camera", cv2.WINDOW_NORMAL)
     cv2.namedWindow("Receiver - SHOW THIS TO SENDER", cv2.WINDOW_NORMAL)
@@ -113,7 +108,7 @@ def receiver():
         if not ret:
             break
 
-        # 1. Scan for incoming Data chunks
+        # Scan for incoming Data chunks
         data, _, _ = detector.detectAndDecode(frame)
         
         if data and data.startswith("D" + HEADER_DELIMITER):
@@ -127,34 +122,27 @@ def receiver():
                     if seq_num == 0:
                         file_name = payload
                         total_chunks = t_chunks
-                        print(f"[+] Metadata received. File: {file_name}")
+                        print(f"Metadata received. File: {file_name}")
                     else:
                         chunks_dict[seq_num] = payload
-                        print(f"[+] Received Chunk {seq_num}/{total_chunks}")
+                        print(f"Received Chunk {seq_num}/{total_chunks}")
                     
-                    # Generate the ACK for the chunk we just got
                     ack_img = create_qr_image(f"A{HEADER_DELIMITER}{seq_num}")
                     expected_seq += 1
 
                 elif seq_num < expected_seq:
-                    # The sender missed our ACK and is re-broadcasting an old chunk.
-                    # Re-generate the ACK for that specific old chunk to help them move forward.
                     ack_img = create_qr_image(f"A{HEADER_DELIMITER}{seq_num}")
 
             except Exception:
                 pass
 
-        # 2. Show the camera view (for alignment)
         cv2.imshow("Receiver Camera", frame)
         
-        # 3. Display the ACK QR code for the sender to scan
         if ack_img is not None:
             cv2.imshow("Receiver - SHOW THIS TO SENDER", ack_img)
 
-        # Check for completion
         if total_chunks > 0 and expected_seq > total_chunks:
-            print("[+] All data received! Sending final ACK buffer...")
-            # Leave the final ACK on screen for a second so the sender can catch it
+            print("All data received! Sending final ACK buffer...")
             cv2.waitKey(2000) 
             break
 
@@ -175,27 +163,27 @@ def receiver():
             output_name = "transferred_" + file_name
             with open(output_name, "wb") as f:
                 f.write(file_bytes)
-            print(f"[+] Success! File saved to disk as: {output_name}")
+            print(f"Success! File saved to disk as: {output_name}")
             
         except Exception as e:
-            print(f"[-] Error reassembling file data: {e}")
+            print(f"Error reassembling file data: {e}")
     else:
-        print("[-] Transfer incomplete. No file saved.")
+        print("Transfer incomplete. No file saved.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  To Send:     python qr_transfer.py send <path_to_file>")
-        print("  To Receive:  python qr_transfer.py receive")
+        print("  To Send:     python main.py send <path_to_file>")
+        print("  To Receive:  python main.py receive")
         sys.exit(1)
 
     mode = sys.argv[1].lower()
     if mode == "send":
         if len(sys.argv) < 3:
-            print("[-] Error: Please specify the path of the file to send.")
+            print("Error: Please specify the path of the file to send.")
             sys.exit(1)
         sender(sys.argv[2])
     elif mode == "receive":
         receiver()
     else:
-        print("[-] Unknown mode. Use 'send' or 'receive'.")
+        print("Unknown mode. Use 'send' or 'receive'.")
